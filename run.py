@@ -95,6 +95,7 @@ Your task is to generate 1 question that a compliance officer or healthcare priv
 </rules>
 
 To generate the question, first identify the most important or relevant part of the context. Then frame a question around that part that satisfies all the rules above.
+Start the question with What, When, Who, Which, How or Under what conditions. Do not start with Can, Does, Is, Must or May unless the context states a prohibition or exception; then ask it so the answer is "No".
 
 Output only the generated question with a "?" at the end, no other text or characters.
 </Instructions>"""
