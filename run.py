@@ -1,24 +1,32 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mlx-lm==0.32.2", "pypdf>=5", "langchain-text-splitters>=0.3"]
+# dependencies = [
+#   "mlx-lm==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+#   "boto3>=1.35", "huggingface_hub>=0.30", "pypdf>=5", "langchain-text-splitters>=0.3",
+# ]
 # ///
-"""Local (Apple Silicon, no AWS) port of the notebook in ../Notebook.
+"""Synthetic RAG eval dataset generator (port of the AWS sample notebook in ./Notebook).
 
-Same pipeline: chunk -> question -> compressed question -> answer -> source sentences
--> critique scores (groundedness, relevance, + standalone) -> filter.
-Stages (each resumable; rerun after an OOM and it continues from the last saved chunk):
-  gen      Qwen3-4B generates rows (+ self-critique scores)  -> data/work/gen.jsonl
-  judge    Qwen3-8B re-scores every row independently       -> data/work/judge.jsonl
-  finalize merge -> data/unfiltered.jsonl, filter on judge scores -> data/test.jsonl,
-           all chunks -> data/corpus.jsonl (retrieval corpus, joins on chunk_id)
-Bedrock Claude 3 Haiku is replaced by a local MLX model; Amazon shareholder letters
-are replaced by public US healthcare regulations. Chunks are processed one at a time.
+Pipeline: chunk -> question -> compressed question -> answer -> source sentences
+-> critique scores (groundedness, relevance, standalone) by a separate judge model -> filter.
+
+  sources   download + chunk the regulatory sources        -> source_docs/
+  generate  generator writes one row per chunk (+ self-scores) -> data/work/gen.jsonl
+  judge     a different model re-scores every row           -> data/work/judge.jsonl
+  filter    merge -> data/unfiltered.jsonl, keep judge scores >= 4 -> data/test.jsonl,
+            all chunks -> data/corpus.jsonl (joins on chunk_id)
+  publish   push card + data to Hugging Face (private)
+  all       sources, generate, judge, filter (each in its own process)
+
+--local uses MLX on Apple Silicon (Qwen3-4B generator, Qwen3-8B judge); without it, Amazon
+Bedrock via the boto3 Converse API (Nova Lite generator, Claude Sonnet 5.5 judge).
+generate/judge are resumable: rerun after a crash and they continue from the last saved chunk.
 """
-import argparse, gzip, json, re, time, urllib.request
+import argparse, gzip, json, os, re, subprocess, sys, time, urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 SRC_DIR = ROOT / "source_docs"  # downloaded files = untrusted data, kept apart from code
 OUT_DIR = ROOT / "data"
 
@@ -243,54 +251,68 @@ def critique_prompts(q, ctx):
     return [GROUNDEDNESS.format(question=q, context=ctx), RELEVANCE.format(question=q), STANDALONE.format(question=q)]
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["gen", "judge", "finalize"])
-    ap.add_argument("--model", help="default: Qwen3-4B-Instruct-2507 for gen, Qwen3-8B for judge")
-    ap.add_argument("--max-chunks", type=int, help="limit chunks (smoke tests); default all")
-    ap.add_argument("--min-score", type=int, default=4, help="keep rows with all three judge scores >= this")
-    args = ap.parse_args()
-    WORK.mkdir(parents=True, exist_ok=True)
-    gen_path, judge_path = WORK / "gen.jsonl", WORK / "judge.jsonl"
+MODELS = {  # (stage, local) -> default model
+    ("generate", True): "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+    ("judge", True): "mlx-community/Qwen3-8B-4bit",
+    ("generate", False): "amazon.nova-lite-v1:0",
+    ("judge", False): "us.anthropic.claude-sonnet-5-5",  # geo profile: no in-Region endpoint in us-east-1
+}
+HF_REPO = "SolvrenAI/hipaa-fda-rag-eval"
 
-    if args.stage == "finalize":
-        judged = {r["chunk_id"]: r for r in read_jsonl(judge_path)}
-        rows = [{**r, **judged[r["chunk_id"]]} for r in read_jsonl(gen_path) if r["chunk_id"] in judged]
-        keep = [r for r in rows if all((r[f"{k}_score"] or 0) >= args.min_score for k in SCORES)]
-        corpus = [dict(chunk_id=r["chunk_id"], source=r["source"], source_url=r["source_url"], cfr_subpart=r["cfr_subpart"],
-                       in_embedding_train=r["in_embedding_train"], text=r["source_chunk"])
-                  for r in read_jsonl(gen_path)]  # every chunk = retrieval corpus incl. distractors
-        for name, rs in (("unfiltered.jsonl", rows), ("test.jsonl", keep), ("corpus.jsonl", corpus)):
-            with open(OUT_DIR / name, "w") as f:
-                f.writelines(json.dumps(r) + "\n" for r in rs)
-        print(f"{len(rows)} generated+judged, {len(keep)} kept (all judge scores >= {args.min_score})")
-        return
 
-    from mlx_lm import batch_generate, load
-    model_id = args.model or {"gen": "mlx-community/Qwen3-4B-Instruct-2507-4bit", "judge": "mlx-community/Qwen3-8B-4bit"}[args.stage]
-    model, tok = load(model_id)
+def make_llm(local, model_id, region="us-east-1", dry_run=False):
+    """The single LLM call: llm(prompts, max_tokens) -> [text]. MLX batch locally, Bedrock Converse in the cloud."""
+    if local:
+        from mlx_lm import batch_generate, load
+        model, tok = load(model_id)
 
-    def llm(prompts, max_tokens):  # greedy decoding; prompts of ONE chunk batched together
-        ids = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False) for p in prompts]
-        return [t.strip() for t in batch_generate(model, tok, ids, max_tokens=max_tokens).texts]
+        def llm(prompts, max_tokens):  # greedy decoding; prompts of ONE chunk batched together
+            ids = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False) for p in prompts]
+            return [t.strip() for t in batch_generate(model, tok, ids, max_tokens=max_tokens).texts]
+        return llm
 
-    if args.stage == "gen":
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-        download()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100, separators=["\n\n", "\n", ".", " ", ""])
-        todo = [(f"{src}#{k}", c, src, url, sub) for text, src, url, sub in load_documents()
-                for k, c in enumerate(c for c in splitter.split_text(text) if len(c) > 300)][: args.max_chunks]
-    else:
-        todo = read_jsonl(gen_path)[: args.max_chunks]
-    done = {r["chunk_id"] for r in read_jsonl(gen_path if args.stage == "gen" else judge_path)}
-    print(f"{model_id}: {len(todo)} chunks, {len(done)} already done (resuming)")
+    client = None if dry_run else __import__("boto3").client("bedrock-runtime", region_name=region)
 
-    t0 = time.time()
-    with open(gen_path if args.stage == "gen" else judge_path, "a") as f:
-        for i, item in enumerate(todo):
-            if (item[0] if args.stage == "gen" else item["chunk_id"]) in done:
+    def llm(prompts, max_tokens):
+        out = []
+        for p, mt in zip(prompts, max_tokens if isinstance(max_tokens, list) else [max_tokens] * len(prompts)):
+            # ponytail: floor of 4096 leaves room for Claude's default adaptive thinking; tune per model if cost matters
+            req = dict(modelId=model_id, messages=[{"role": "user", "content": [{"text": p}]}], inferenceConfig={"maxTokens": max(mt, 4096)})
+            if dry_run:
+                shown = {**req, "messages": [{"role": "user", "content": [{"text": p[:200] + ("..." if len(p) > 200 else "")}]}]}
+                print(f"[dry-run] bedrock-runtime.converse region={region} " + json.dumps(shown))
+                out.append("[dry-run]")
                 continue
-            if args.stage == "gen":
+            msg = client.converse(**req)["output"]["message"]
+            out.append("".join(b["text"] for b in msg["content"] if "text" in b).strip())
+        return out
+    return llm
+
+
+def load_chunks(max_chunks=None):
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    download()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100, separators=["\n\n", "\n", ".", " ", ""])
+    return [(f"{src}#{k}", c, src, url, sub) for text, src, url, sub in load_documents()
+            for k, c in enumerate(c for c in splitter.split_text(text) if len(c) > 300)][:max_chunks]
+
+
+def run_stage(stage, args):
+    """generate / judge: resumable, one chunk at a time, appends one JSON line per chunk."""
+    model_id = args.model or MODELS[(stage, args.local)]
+    llm = make_llm(args.local, model_id, args.region, args.dry_run)
+    gen_path, judge_path = WORK / "gen.jsonl", WORK / "judge.jsonl"
+    out_path = gen_path if stage == "generate" else judge_path
+    todo = load_chunks(args.max_chunks) if stage == "generate" else read_jsonl(gen_path)[: args.max_chunks]
+    done = {r["chunk_id"] for r in read_jsonl(out_path)}
+    print(f"{stage} with {model_id}: {len(todo)} chunks, {len(done)} already done (resuming)")
+    WORK.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    with open(os.devnull if args.dry_run else out_path, "a") as f:
+        for i, item in enumerate(todo):
+            if not args.dry_run and (item[0] if stage == "generate" else item["chunk_id"]) in done:
+                continue
+            if stage == "generate":
                 cid, ctx, src, url, sub = item
                 (q,) = llm([QUESTION.format(context=ctx)], 80)
                 comp, ans, sent, *crit = llm([COMPRESS.format(question=q), ANSWER.format(question=q, context=ctx),
@@ -305,8 +327,86 @@ def main():
                            **{f"{k}_score": rating(c) for k, c in zip(SCORES, crit)},
                            **{f"{k}_reasoning": reasoning(c) for k, c in zip(SCORES, crit)})
             f.write(json.dumps(row) + "\n"); f.flush()
-            print(f"[{i + 1}/{len(todo)}] {time.time() - t0:.0f}s " + " ".join(f"{k.split('_')[-2][0].upper()}{v}" for k, v in row.items() if k.endswith("_score")))
-    print(f"{args.stage} done in {time.time() - t0:.0f}s")
+            print(f"[{i + 1}/{len(todo)}] {time.time() - t0:.0f}s " + " ".join(f"{k.split('_')[-2][0].upper()}{v}" for k, v in row.items() if k.endswith("_score")), flush=True)
+            if args.dry_run:
+                print("[dry-run] stopped after one chunk; nothing written")
+                break
+    print(f"{stage} done in {time.time() - t0:.0f}s")
+
+
+def filter_rows(min_score, dry_run=False):
+    judged = {r["chunk_id"]: r for r in read_jsonl(WORK / "judge.jsonl")}
+    gen = read_jsonl(WORK / "gen.jsonl")
+    rows = [{**r, **judged[r["chunk_id"]]} for r in gen if r["chunk_id"] in judged]
+    keep = [r for r in rows if all((r[f"{k}_score"] or 0) >= min_score for k in SCORES)]
+    corpus = [dict(chunk_id=r["chunk_id"], source=r["source"], source_url=r["source_url"], cfr_subpart=r["cfr_subpart"],
+                   in_embedding_train=r["in_embedding_train"], text=r["source_chunk"]) for r in gen]  # all chunks incl. distractors
+    for name, rs in (("unfiltered.jsonl", rows), ("test.jsonl", keep), ("corpus.jsonl", corpus)):
+        if dry_run:
+            print(f"[dry-run] would write {len(rs)} rows to data/{name}")
+            continue
+        with open(OUT_DIR / name, "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rs)
+    print(f"{len(rows)} generated+judged, {len(keep)} kept (all judge scores >= {min_score}), {len(corpus)} corpus chunks")
+
+
+def publish(env_file, dry_run):
+    files = {"README.md": ROOT / "DATASET_CARD.md", **{f"data/{n}": OUT_DIR / n for n in ("test.jsonl", "unfiltered.jsonl", "corpus.jsonl")}}
+    if dry_run:
+        print(f"[dry-run] would upload to private dataset {HF_REPO}: " + ", ".join(f"{k} <- {v.relative_to(ROOT)}" for k, v in files.items()))
+        return
+    if "HF_TOKEN" not in os.environ and Path(env_file).exists():  # into this process's env only; never printed
+        for line in open(env_file):
+            if line.startswith("HF_TOKEN="):
+                os.environ["HF_TOKEN"] = line.split("=", 1)[1].strip().strip("\"'")
+    from huggingface_hub import CommitOperationAdd, HfApi
+    api = HfApi()
+    api.create_repo(HF_REPO, repo_type="dataset", private=True, exist_ok=True)
+    c = api.create_commit(HF_REPO, repo_type="dataset", commit_message="Sync dataset card and data from rag-eval-generator",
+                          operations=[CommitOperationAdd(k, str(v)) for k, v in files.items()])
+    info = api.dataset_info(HF_REPO)
+    print(f"published {c.commit_url} (private={info.private})")
+
+
+def selftest():
+    for local in (True, False):  # generator and judge must be different models in both modes
+        assert MODELS[("generate", local)] != MODELS[("judge", local)]
+    assert all(m.startswith("mlx-community/") for (_, local), m in MODELS.items() if local)
+    assert not any(m.startswith("mlx-community/") for (_, local), m in MODELS.items() if not local)
+    out = make_llm(False, MODELS[("judge", False)], dry_run=True)(["p1", "p2"], [10, 20])  # cloud dry-run: no AWS client, no call
+    assert out == ["[dry-run]", "[dry-run]"]
+    print("selftest ok")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", choices=["sources", "generate", "judge", "filter", "publish", "all", "selftest"])
+    ap.add_argument("--local", action="store_true", help="run models locally with MLX instead of Amazon Bedrock")
+    ap.add_argument("--dry-run", action="store_true", help="cloud mode, filter and publish: print what would be sent/written, send and write nothing")
+    ap.add_argument("--model", help="override the stage's default model")
+    ap.add_argument("--region", default="us-east-1", help="AWS region for Bedrock (default us-east-1)")
+    ap.add_argument("--max-chunks", type=int, help="limit chunks (smoke tests); default all")
+    ap.add_argument("--min-score", type=int, default=4, help="filter: keep rows with all three judge scores >= this")
+    ap.add_argument("--env-file", default=str(ROOT.parent / ".env"), help="publish: file holding HF_TOKEN (read into env only)")
+    args = ap.parse_args()
+    if args.dry_run and args.local:
+        ap.error("--dry-run applies to cloud mode (and publish) only")
+    OUT_DIR.mkdir(exist_ok=True)
+
+    if args.command == "sources":
+        print(f"{len(load_chunks(args.max_chunks))} chunks from {len(SOURCES)} sources in {SRC_DIR}")
+    elif args.command in ("generate", "judge"):
+        run_stage(args.command, args)
+    elif args.command == "filter":
+        filter_rows(args.min_score, args.dry_run)
+    elif args.command == "publish":
+        publish(args.env_file, args.dry_run)
+    elif args.command == "selftest":
+        selftest()
+    else:  # all: one process per stage, so only one model is ever in memory
+        passthru = [a for a in sys.argv[1:] if a != "all"]
+        for stage in ("sources", "generate", "judge", "filter"):
+            subprocess.run([sys.executable, __file__, stage, *passthru], check=True)
 
 
 if __name__ == "__main__":
