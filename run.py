@@ -8,12 +8,12 @@
 """Synthetic RAG eval dataset generator (port of the AWS sample notebook in ./Notebook).
 
 Pipeline: chunk -> question -> compressed question -> answer -> source sentences
--> critique scores (groundedness, relevance, standalone) by a separate judge model -> filter.
+-> critique scores (groundedness, relevance, standalone, answer_correctness) by a separate judge model -> filter.
 
   sources   download + chunk the regulatory sources        -> source_docs/
   generate  generator writes one row per chunk (+ self-scores) -> data/work/gen.jsonl
   judge     a different model re-scores every row           -> data/work/judge.jsonl
-  filter    merge -> data/unfiltered.jsonl, keep judge scores >= 4 -> data/test.jsonl,
+  filter    merge -> data/unfiltered.jsonl, keep all four judge scores >= 4 -> data/test.jsonl,
             all chunks -> data/corpus.jsonl (joins on chunk_id)
   publish   push card + data to Hugging Face (private)
   all       sources, generate, judge, filter (each in its own process)
@@ -215,7 +215,9 @@ You will be given a question. Your task is to evaluate how context-independent i
 
 1 = The question only makes sense with the original passage (e.g. refers to "this section", "the document", "the above")
 3 = The question is mostly understandable but leaves important referents vague
-5 = The question is fully self-contained; technical terms and abbreviations (e.g. HIPAA, PHI, CE, BA, FDA) are fine
+5 = The question is fully self-contained
+
+Standard regulatory abbreviations (HIPAA, PHI, ePHI, CE, BA, HHS, FDA, CFR) and section citations are NOT vague referents: a compliance professional knows them. Do not lower the rating for using them.
 
 Provide your evaluation in the following format:
 
@@ -226,6 +228,41 @@ Provide your evaluation in the following format:
 Here is the question:
 
 {question}
+</Instructions>"""
+
+# Added: the three critiques above rate only the question; this one checks the reference answer.
+ANSWER_CORRECTNESS = """<Instructions>
+You will be given a context, a question and a reference answer. Your task is to evaluate whether the reference answer is correct and fully supported by the context. Check carefully:
+- exceptions and conditions in the context (e.g. "except", "unless", "if", "only when") that the answer omits or ignores
+- "may" (permitted) versus "must"/"shall"/"should" (required)
+- yes/no polarity: a "Yes" or "No" must match what the context actually says
+- overgeneralization beyond what the context states
+
+Rate this on a scale from 1 to 5, where:
+
+1 = The answer contradicts the context (e.g. wrong yes/no, permitted vs prohibited)
+2 = The answer is mostly wrong or misreads a condition
+3 = The answer is partly right but omits a condition or exception that changes its meaning, or overgeneralizes
+4 = The answer is correct with minor imprecision
+5 = The answer is fully correct and supported by the context
+
+<context>
+{context}
+</context>
+
+<question>
+{question}
+</question>
+
+<answer>
+{answer}
+</answer>
+
+Provide your evaluation in the following format:
+
+<rating>(Your rating from 1 to 5)</rating>
+
+<evaluation>(Your evaluation and reasoning for the rating in one sentence)</evaluation>
 </Instructions>"""
 
 
@@ -239,7 +276,7 @@ def reasoning(text):
     return m.group(1).strip() if m else None
 
 
-SCORES = ("groundedness", "relevance", "standalone")
+SCORES = ("groundedness", "relevance", "standalone", "answer_correctness")  # generator self-scores only the first three
 WORK = OUT_DIR / "work"  # resumable per-stage outputs, one JSON line per chunk
 
 
@@ -247,8 +284,9 @@ def read_jsonl(path):  # a last line without "\n" is a half-written row from a c
     return [json.loads(l) for l in open(path) if l.endswith("\n")] if path.exists() else []
 
 
-def critique_prompts(q, ctx):
-    return [GROUNDEDNESS.format(question=q, context=ctx), RELEVANCE.format(question=q), STANDALONE.format(question=q)]
+def critique_prompts(q, ctx, ans=None):
+    return [GROUNDEDNESS.format(question=q, context=ctx), RELEVANCE.format(question=q), STANDALONE.format(question=q)] + (
+        [ANSWER_CORRECTNESS.format(question=q, context=ctx, answer=ans)] if ans is not None else [])
 
 
 MODELS = {  # (stage, local) -> default model
@@ -312,7 +350,7 @@ def run_stage(stage, args):
     other = {r["generator_model" if stage == "generate" else "judge_model"] for r in prev} - {model_id}
     if other and not args.dry_run:  # resuming with another model would silently mix models in one dataset
         sys.exit(f"{out_path} already has rows from {', '.join(sorted(other))}; move data/work/ aside to switch models")
-    done = {r["chunk_id"] for r in prev if stage == "generate" or None not in (r[f"{k}_score"] for k in SCORES)}
+    done = {r["chunk_id"] for r in prev if stage == "generate" or None not in (r.get(f"{k}_score") for k in SCORES)}
     llm = make_llm(args.local, model_id, args.region, args.dry_run)
     print(f"{stage} with {model_id}: {len(todo)} chunks, {len(done)} already done (resuming)")
     WORK.mkdir(parents=True, exist_ok=True)
@@ -331,7 +369,7 @@ def run_stage(stage, args):
                            source=src, source_url=url, cfr_subpart=sub, in_embedding_train=sub == "E",
                            generator_model=model_id, **{f"self_{k}_score": rating(c) for k, c in zip(SCORES, crit)})
             else:
-                crit = llm(critique_prompts(item["question"], item["source_chunk"]), [200, 200, 120])
+                crit = llm(critique_prompts(item["question"], item["source_chunk"], item["answer"]), [200, 200, 120, 200])
                 row = dict(chunk_id=item["chunk_id"], judge_model=model_id,
                            **{f"{k}_score": rating(c) for k, c in zip(SCORES, crit)},
                            **{f"{k}_reasoning": reasoning(c) for k, c in zip(SCORES, crit)})
@@ -347,7 +385,7 @@ def filter_rows(min_score, dry_run=False, force=False, work=WORK, out=OUT_DIR):
     judged = {r["chunk_id"]: r for r in read_jsonl(work / "judge.jsonl")}
     gen = read_jsonl(work / "gen.jsonl")
     rows = [{**r, **judged[r["chunk_id"]]} for r in gen if r["chunk_id"] in judged]
-    keep = [r for r in rows if all((r[f"{k}_score"] or 0) >= min_score for k in SCORES)]
+    keep = [r for r in rows if all((r.get(f"{k}_score") or 0) >= min_score for k in SCORES)]
     corpus = [dict(chunk_id=r["chunk_id"], source=r["source"], source_url=r["source_url"], cfr_subpart=r["cfr_subpart"],
                    in_embedding_train=r["in_embedding_train"], text=r["source_chunk"]) for r in gen]  # all chunks incl. distractors
     have = len(read_jsonl(out / "unfiltered.jsonl"))
@@ -389,6 +427,7 @@ def selftest():
     assert not any(m.startswith("mlx-community/") for (_, local), m in MODELS.items() if not local)
     out = make_llm(False, MODELS[("judge", False)], dry_run=True)(["p1", "p2"], [10, 20])  # cloud dry-run: no AWS client, no call
     assert out == ["[dry-run]", "[dry-run]"]
+    assert len(critique_prompts("q", "c")) == 3 and "<answer>\na\n</answer>" in critique_prompts("q", "c", "a")[3]
     import tempfile
     with tempfile.TemporaryDirectory() as d:  # filter must not shrink existing data (fresh clone / smoke run)
         d = Path(d); (d / "unfiltered.jsonl").write_text("{}\n{}\n")
@@ -415,7 +454,7 @@ def main():
     ap.add_argument("--model", help="override the stage's default model")
     ap.add_argument("--region", default="us-east-1", help="AWS region for Bedrock (default us-east-1)")
     ap.add_argument("--max-chunks", type=int, help="limit chunks (smoke tests); default all")
-    ap.add_argument("--min-score", type=int, default=4, help="filter: keep rows with all three judge scores >= this")
+    ap.add_argument("--min-score", type=int, default=4, help="filter: keep rows with all four judge scores >= this")
     ap.add_argument("--force", action="store_true", help="filter: allow replacing data/*.jsonl with fewer rows")
     ap.add_argument("--env-file", default=str(ROOT.parent / ".env"), help="publish: file holding HF_TOKEN (read into env only)")
     args = ap.parse_args()
