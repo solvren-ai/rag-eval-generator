@@ -15,7 +15,7 @@ Pipeline: chunk -> question -> compressed question -> answer -> source sentences
   judge     a different model re-scores every row           -> data/work/judge.jsonl
   filter    merge -> data/unfiltered.jsonl, keep all four judge scores >= 4 -> data/test.jsonl,
             all chunks -> data/corpus.jsonl (joins on chunk_id)
-  publish   push card + data to Hugging Face (private)
+  publish   push card + data to Hugging Face (new repos are created private)
   all       sources, generate, judge, filter (each in its own process)
 
 --local uses MLX on Apple Silicon (Qwen3-4B generator, Qwen3-8B judge); without it, Amazon
@@ -400,10 +400,14 @@ def filter_rows(min_score, dry_run=False, force=False, work=WORK, out=OUT_DIR):
     print(f"{len(rows)} generated+judged, {len(keep)} kept (all judge scores >= {min_score}), {len(corpus)} corpus chunks")
 
 
+def may_publish(existed, private):  # never CREATE a public repo; updating an existing one (public or private) is fine
+    return existed or private
+
+
 def publish(env_file, dry_run):
     files = {"README.md": ROOT / "DATASET_CARD.md", **{f"data/{n}": OUT_DIR / n for n in ("test.jsonl", "unfiltered.jsonl", "corpus.jsonl")}}
     if dry_run:
-        print(f"[dry-run] would upload to private dataset {HF_REPO}: " + ", ".join(f"{k} <- {v.relative_to(ROOT)}" for k, v in files.items()))
+        print(f"[dry-run] would upload to dataset {HF_REPO} (created private if missing): " + ", ".join(f"{k} <- {v.relative_to(ROOT)}" for k, v in files.items()))
         return
     if "HF_TOKEN" not in os.environ and Path(env_file).exists():  # into this process's env only; never printed
         for line in open(env_file):
@@ -411,9 +415,10 @@ def publish(env_file, dry_run):
                 os.environ["HF_TOKEN"] = line.split("=", 1)[1].strip().strip("\"'")
     from huggingface_hub import CommitOperationAdd, HfApi
     api = HfApi()
-    api.create_repo(HF_REPO, repo_type="dataset", private=True, exist_ok=True)  # exist_ok does NOT make an existing repo private
-    if not api.dataset_info(HF_REPO).private:
-        sys.exit(f"refusing to publish: {HF_REPO} is public")
+    existed = api.repo_exists(HF_REPO, repo_type="dataset")
+    api.create_repo(HF_REPO, repo_type="dataset", private=True, exist_ok=True)  # exist_ok keeps an existing repo's visibility
+    if not may_publish(existed, api.dataset_info(HF_REPO).private):
+        sys.exit(f"refusing to publish: {HF_REPO} was just created public")
     c = api.create_commit(HF_REPO, repo_type="dataset", commit_message="Sync dataset card and data from rag-eval-generator",
                           operations=[CommitOperationAdd(k, str(v)) for k, v in files.items()])
     info = api.dataset_info(HF_REPO)
@@ -428,6 +433,7 @@ def selftest():
     out = make_llm(False, MODELS[("judge", False)], dry_run=True)(["p1", "p2"], [10, 20])  # cloud dry-run: no AWS client, no call
     assert out == ["[dry-run]", "[dry-run]"]
     assert len(critique_prompts("q", "c")) == 3 and "<answer>\na\n</answer>" in critique_prompts("q", "c", "a")[3]
+    assert may_publish(True, False) and may_publish(True, True) and may_publish(False, True) and not may_publish(False, False)
     import tempfile
     with tempfile.TemporaryDirectory() as d:  # filter must not shrink existing data (fresh clone / smoke run)
         d = Path(d); (d / "unfiltered.jsonl").write_text("{}\n{}\n")

@@ -107,7 +107,7 @@ uv run run.py generate --model us.amazon.nova-lite-v1:0   # override a stage's m
 # other
 uv run run.py sources                        # download + chunk only
 uv run run.py publish --dry-run              # show what would be pushed to HF
-uv run run.py publish                        # push card + data to SolvrenAI/hipaa-fda-rag-eval (private)
+uv run run.py publish                        # push card + data to SolvrenAI/hipaa-fda-rag-eval (never creates a public repo; updates the existing one, public or private)
 uv run run.py selftest                       # assert-based checks: model dispatch, filter guard, partial-line read
 ```
 
@@ -126,7 +126,7 @@ Outputs:
 - `data/work/`: resumable per-stage outputs (gitignored)
 - `data/unfiltered.jsonl`: every row with judge scores, reasoning and self-scores
 - `data/corpus.jsonl`: all chunks (retrieval corpus with distractors; joins on `chunk_id`)
-- `data/test.jsonl`: filtered rows, Hugging Face-ready (see `DATASET_CARD.md`). Published privately as [`SolvrenAI/hipaa-fda-rag-eval`](https://huggingface.co/datasets/SolvrenAI/hipaa-fda-rag-eval).
+- `data/test.jsonl`: filtered rows, Hugging Face-ready (see `DATASET_CARD.md`). Published as [`SolvrenAI/hipaa-fda-rag-eval`](https://huggingface.co/datasets/SolvrenAI/hipaa-fda-rag-eval).
 
 The published dataset was generated in `--local` mode.
 
