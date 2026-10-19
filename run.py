@@ -334,18 +334,21 @@ def run_stage(stage, args):
     print(f"{stage} done in {time.time() - t0:.0f}s")
 
 
-def filter_rows(min_score, dry_run=False):
-    judged = {r["chunk_id"]: r for r in read_jsonl(WORK / "judge.jsonl")}
-    gen = read_jsonl(WORK / "gen.jsonl")
+def filter_rows(min_score, dry_run=False, force=False, work=WORK, out=OUT_DIR):
+    judged = {r["chunk_id"]: r for r in read_jsonl(work / "judge.jsonl")}
+    gen = read_jsonl(work / "gen.jsonl")
     rows = [{**r, **judged[r["chunk_id"]]} for r in gen if r["chunk_id"] in judged]
     keep = [r for r in rows if all((r[f"{k}_score"] or 0) >= min_score for k in SCORES)]
     corpus = [dict(chunk_id=r["chunk_id"], source=r["source"], source_url=r["source_url"], cfr_subpart=r["cfr_subpart"],
                    in_embedding_train=r["in_embedding_train"], text=r["source_chunk"]) for r in gen]  # all chunks incl. distractors
+    have = len(read_jsonl(out / "unfiltered.jsonl"))
+    if not dry_run and not force and (not rows or len(rows) < have):  # fresh clone / smoke run would wipe committed data
+        sys.exit(f"refusing to replace {have} rows in {out}/unfiltered.jsonl with {len(rows)}; pass --force to overwrite")
     for name, rs in (("unfiltered.jsonl", rows), ("test.jsonl", keep), ("corpus.jsonl", corpus)):
         if dry_run:
             print(f"[dry-run] would write {len(rs)} rows to data/{name}")
             continue
-        with open(OUT_DIR / name, "w") as f:
+        with open(out / name, "w") as f:
             f.writelines(json.dumps(r) + "\n" for r in rs)
     print(f"{len(rows)} generated+judged, {len(keep)} kept (all judge scores >= {min_score}), {len(corpus)} corpus chunks")
 
@@ -361,7 +364,9 @@ def publish(env_file, dry_run):
                 os.environ["HF_TOKEN"] = line.split("=", 1)[1].strip().strip("\"'")
     from huggingface_hub import CommitOperationAdd, HfApi
     api = HfApi()
-    api.create_repo(HF_REPO, repo_type="dataset", private=True, exist_ok=True)
+    api.create_repo(HF_REPO, repo_type="dataset", private=True, exist_ok=True)  # exist_ok does NOT make an existing repo private
+    if not api.dataset_info(HF_REPO).private:
+        sys.exit(f"refusing to publish: {HF_REPO} is public")
     c = api.create_commit(HF_REPO, repo_type="dataset", commit_message="Sync dataset card and data from rag-eval-generator",
                           operations=[CommitOperationAdd(k, str(v)) for k, v in files.items()])
     info = api.dataset_info(HF_REPO)
@@ -375,6 +380,18 @@ def selftest():
     assert not any(m.startswith("mlx-community/") for (_, local), m in MODELS.items() if not local)
     out = make_llm(False, MODELS[("judge", False)], dry_run=True)(["p1", "p2"], [10, 20])  # cloud dry-run: no AWS client, no call
     assert out == ["[dry-run]", "[dry-run]"]
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:  # filter must not shrink existing data (fresh clone / smoke run)
+        d = Path(d); (d / "unfiltered.jsonl").write_text("{}\n{}\n")
+        row = dict(chunk_id="c", source="s", source_url="u", cfr_subpart=None, in_embedding_train=False, source_chunk="t")
+        (d / "gen.jsonl").write_text(json.dumps(row) + "\n")
+        (d / "judge.jsonl").write_text(json.dumps(dict(chunk_id="c", **{f"{k}_score": 5 for k in SCORES})) + "\n")
+        try:
+            filter_rows(4, work=d, out=d); raise AssertionError("filter overwrote 2 rows with 1")
+        except SystemExit:
+            pass
+        filter_rows(4, force=True, work=d, out=d)
+        assert len(read_jsonl(d / "test.jsonl")) == 1
     print("selftest ok")
 
 
@@ -387,10 +404,13 @@ def main():
     ap.add_argument("--region", default="us-east-1", help="AWS region for Bedrock (default us-east-1)")
     ap.add_argument("--max-chunks", type=int, help="limit chunks (smoke tests); default all")
     ap.add_argument("--min-score", type=int, default=4, help="filter: keep rows with all three judge scores >= this")
+    ap.add_argument("--force", action="store_true", help="filter: allow replacing data/*.jsonl with fewer rows")
     ap.add_argument("--env-file", default=str(ROOT.parent / ".env"), help="publish: file holding HF_TOKEN (read into env only)")
     args = ap.parse_args()
     if args.dry_run and args.local:
         ap.error("--dry-run applies to cloud mode (and publish) only")
+    if args.command == "all" and args.model:
+        ap.error("--model with all would make the generator its own judge; set it per stage")
     OUT_DIR.mkdir(exist_ok=True)
 
     if args.command == "sources":
@@ -398,7 +418,7 @@ def main():
     elif args.command in ("generate", "judge"):
         run_stage(args.command, args)
     elif args.command == "filter":
-        filter_rows(args.min_score, args.dry_run)
+        filter_rows(args.min_score, args.dry_run, args.force)
     elif args.command == "publish":
         publish(args.env_file, args.dry_run)
     elif args.command == "selftest":

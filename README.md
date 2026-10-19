@@ -62,8 +62,8 @@ For more information on the fine-grained action and resource permissions in Bedr
 Once your notebook environment is set up, clone this workshop repository into it.
 
 ```sh
-git clone https://github.com/aws-samples/generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems.git
-cd generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems/Notebook 
+git clone https://github.com/solvren-ai/rag-eval-generator.git
+cd rag-eval-generator/Notebook
 ```
 
 
@@ -94,15 +94,15 @@ cd rag-eval-generator
 
 # local (Apple Silicon, no cloud)
 uv run run.py all --local                    # sources -> generate -> judge -> filter
-uv run run.py all --local --max-chunks 3     # smoke test (~30 s)
+uv run run.py all --local --max-chunks 3     # smoke test (~30 s); filter refuses to shrink committed data/ (--force to overwrite)
 uv run run.py generate --local               # or stage by stage; rerun to resume
 uv run run.py judge --local
 uv run run.py filter                         # data/unfiltered.jsonl, data/test.jsonl, data/corpus.jsonl
 
 # cloud (Amazon Bedrock)
-uv run run.py all --dry-run --max-chunks 1   # print the Converse requests, send nothing
+uv run run.py all --dry-run --max-chunks 1   # print the Converse requests, send nothing to Bedrock
 uv run run.py all --region us-east-1
-uv run run.py generate --model us.amazon.nova-lite-v1:0   # override a stage's model
+uv run run.py generate --model us.amazon.nova-lite-v1:0   # override a stage's model (not allowed with all)
 
 # other
 uv run run.py sources                        # download + chunk only
@@ -111,11 +111,13 @@ uv run run.py publish                        # push card + data to SolvrenAI/hip
 uv run run.py selftest                       # assert-based check of mode/model dispatch
 ```
 
-Shared flags: `--local`, `--dry-run` (cloud, `filter` and `publish`: print what would be sent or written, then send and write nothing), `--model`, `--region` (default `us-east-1`), `--max-chunks`, `--min-score` (filter, default 4).
+Shared flags: `--local`, `--dry-run` (cloud, `filter` and `publish`: print what would be sent or written, then send and write nothing; `sources` still downloads missing source files), `--model`, `--region` (default `us-east-1`), `--max-chunks`, `--min-score` (filter, default 4), `--force` (filter: allow replacing `data/*.jsonl` with fewer rows). On a fresh clone `data/work/` is empty, so a cloud dry-run of `judge` prints no requests until `generate` has run for real.
+
+All modes need network access to ecfr.gov and fda.gov the first time, to download the sources.
 
 **Local prerequisites:** an Apple Silicon Mac, [uv](https://docs.astral.sh/uv/), about 7 GB of disk for the two models and about 6 GB of free unified memory. `mlx-lm` installs only on macOS arm64.
 
-**Cloud prerequisites:** AWS credentials for an account with Amazon Bedrock model access to **Amazon Nova Lite** and **Anthropic Claude Sonnet 5.5** (for Anthropic models, the account's use-case form must be accepted), plus `bedrock:InvokeModel` on both. Sonnet 5.5 has no in-Region endpoint in us-east-1, so the judge uses the `us.` cross-Region inference profile. Use `--model` to point at a `global.` profile or another Region's profile.
+**Cloud prerequisites:** AWS credentials for an account with Amazon Bedrock model access to **Amazon Nova Lite** and **Anthropic Claude Sonnet 5.5** (for Anthropic models, the account's use-case form must be accepted), plus `bedrock:InvokeModel` on both. Because the judge goes through a cross-Region inference profile, the IAM policy must allow the inference profile (`arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-5-5`) and the foundation model in every destination Region (`arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-5`); the example policy above covers only foundation models. Sonnet 5.5 has no in-Region endpoint in us-east-1, so the judge uses the `us.` cross-Region inference profile. Use `--model` to point at a `global.` profile or another Region's profile.
 
 **Publish prerequisites:** `HF_TOKEN` with write access to the `SolvrenAI` org, either in the environment or in `../.env` (`--env-file` to change). It is read into the process environment only and never printed.
 
