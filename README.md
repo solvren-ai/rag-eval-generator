@@ -84,7 +84,7 @@ The pipeline is the same as the notebook's: chunk (1500/100) → question → co
 | `--local` | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | `mlx-community/Qwen3-8B-4bit` | Apple Silicon via [MLX](https://github.com/ml-explore/mlx-lm) |
 | default (cloud) | `amazon.nova-lite-v1:0` | `us.anthropic.claude-sonnet-5-5` | Amazon Bedrock, boto3 Converse API |
 
-All model calls go through one function (`make_llm`), so both modes share the same pipeline. `generate` and `judge` append one line per chunk to `data/work/`. If a run dies (for example from a Metal out-of-memory error), rerun the same command and it continues from the last saved chunk. `all` runs each stage in its own process, so only one model is in memory at a time.
+All model calls go through one function (`make_llm`), so both modes share the same pipeline. `generate` and `judge` append one line per chunk to `data/work/`. If a run dies (for example from a Metal out-of-memory error), rerun the same command and it continues from the last saved chunk. A half-written last line is dropped, and judge rows with an unparseable score are redone. Resuming with a different model than the one in `data/work/` is refused; move `data/work/` aside to switch models or modes. `all` runs each stage in its own process, so only one model is in memory at a time.
 
 ### Commands
 
@@ -108,7 +108,7 @@ uv run run.py generate --model us.amazon.nova-lite-v1:0   # override a stage's m
 uv run run.py sources                        # download + chunk only
 uv run run.py publish --dry-run              # show what would be pushed to HF
 uv run run.py publish                        # push card + data to SolvrenAI/hipaa-fda-rag-eval (private)
-uv run run.py selftest                       # assert-based check of mode/model dispatch
+uv run run.py selftest                       # assert-based checks: model dispatch, filter guard, partial-line read
 ```
 
 Shared flags: `--local`, `--dry-run` (cloud, `filter` and `publish`: print what would be sent or written, then send and write nothing; `sources` still downloads missing source files), `--model`, `--region` (default `us-east-1`), `--max-chunks`, `--min-score` (filter, default 4), `--force` (filter: allow replacing `data/*.jsonl` with fewer rows). On a fresh clone `data/work/` is empty, so a cloud dry-run of `judge` prints no requests until `generate` has run for real.

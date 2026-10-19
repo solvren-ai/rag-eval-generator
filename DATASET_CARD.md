@@ -31,6 +31,8 @@ configs:
 
 133 synthetic question/answer/context triples for evaluating retrieval-augmented generation (RAG) over public US healthcare regulation, together with the full 345-chunk retrieval corpus they were drawn from. Questions are written from the point of view of a compliance officer or healthcare privacy analyst.
 
+> **Data quality warning.** In LLM-agent spot-checks of 35 kept rows, **8 (about 23%) had a wrong or only partly right reference answer.** No filter step checks the answers: all three judge scores rate the *question*. 95 of 133 questions (71%) are yes/no questions, and the answers lean heavily "Yes" (74 open with "Yes", 11 with "No"). Use the set mainly for retrieval evaluation via `chunk_id`, and verify `answer` before treating it as ground truth. See [Limitations](#limitations).
+
 ```python
 from datasets import load_dataset
 qa = load_dataset("SolvrenAI/hipaa-fda-rag-eval", split="test")                    # 133 QA rows
@@ -62,11 +64,11 @@ This is a local port of the AWS sample [generating-synthetic-datasets-for-evalua
 
 1. **Chunking.** The CFR is split one document per section, the FDA PDF one document per page. Each document is chunked with `RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100)`, dropping chunks under 300 characters, giving 345 chunks. Every chunk is used.
 2. **Generation.** [`mlx-community/Qwen3-4B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit) (Apache-2.0) produces, for each chunk: a question, a compressed rewrite, a reference answer grounded only in the chunk, and the supporting sentences (`context`). It also self-scores the question (`self_*_score`).
-3. **Independent judge.** [`mlx-community/Qwen3-8B-4bit`](https://huggingface.co/mlx-community/Qwen3-8B-4bit) (Apache-2.0, thinking disabled) is a different and larger model, loaded only after the generator was unloaded. It scores every question from 1 to 5:
+3. **Independent judge.** [`mlx-community/Qwen3-8B-4bit`](https://huggingface.co/mlx-community/Qwen3-8B-4bit) (Apache-2.0, thinking disabled) is a different and larger model from the same family, loaded only after the generator was unloaded. It scores every question from 1 to 5. None of the three critiques sees the reference answer:
    - **groundedness**: whether the chunk fully answers the question (original notebook prompt)
    - **relevance**: usefulness to a compliance officer or healthcare privacy analyst (notebook prompt with the persona rewritten)
    - **standalone**: whether the question is understandable without the passage (added)
-4. **Filter.** A row is kept only when all three **judge** scores are ≥ 4. 345 generated → 133 kept (39%). Filtering on the 4B self-scores instead would have kept 247 rows. The 8B judge is clearly stricter, mainly on standalone and groundedness.
+4. **Filter.** A row is kept only when all three **judge** scores are ≥ 4. 345 generated → 133 kept (39%). Filtering on the 4B self-scores instead would have kept 247 rows. The 8B judge is stricter, mainly on standalone and groundedness, but not always correctly: of the 134 questions it scored 3 on standalone, 95 have reasoning that names "CE" or "PHI" as vague, although the rubric allows standard abbreviations. That drops valid Privacy Rule questions.
 
 Runtime: generation took 2,674 s (about 45 min) for 345 chunks. Judging took 1,164 s for the last 285 rows, plus roughly 4 min for the first 60 in an earlier, interrupted run.
 
@@ -85,7 +87,13 @@ Self-scores (Qwen3-4B, all 345): groundedness 5:113 / 4:185 / 3:20 / 2:25 / 1:2;
 
 ### Spot-check
 
-An LLM agent, not a human, spot-checked 20 random kept rows (`random.Random(42).sample` over `data/test.jsonl`). Each answer was checked against its `source_chunk`. **16 of 20 passed (80%).** The failures:
+An LLM agent, not a human, spot-checked kept rows, checking each answer against its `source_chunk`. Nobody has reviewed the rows by hand.
+
+- First sample: 20 rows (`random.Random(42).sample` over `data/test.jsonl`). **16 of 20 passed.**
+- Second sample: 15 more rows (seed 7, excluding the first sample). 11 passed, 2 were partly right, 2 failed: one attributes testing standards to labeling requirements, one misframes a 164.501 definition.
+- **Combined: 27 of 35 clean passes; 8 of 35 (about 23%) wrong or partly right.** With n = 35 that rate is a rough estimate, not a measurement.
+
+Failures in the first sample:
 
 | chunk_id | Failure type |
 |---|---|
@@ -94,7 +102,7 @@ An LLM agent, not a human, spot-checked 20 random kept rows (`random.Random(42).
 | `45 CFR 164.508#5` | Misread conditional: a clause about conditioning enrollment on an authorization is answered as a permission to disclose |
 | `45 CFR 164.524#6` | Self-contradictory answer (says "No", then "yes") |
 
-The main pattern is yes/no questions about rules that come with exceptions. Expect roughly 1 in 5 reference answers to have a substantive error. The questions and `source_chunk` are more reliable than the answers. Among the passes, several answers mention "the context" or bare paragraph numbers, which is harmless but stylistically off.
+The main pattern is yes/no questions about rules that come with exceptions. Expect roughly 1 in 4 or 5 reference answers to be wrong or incomplete. The questions and `source_chunk` are more reliable than the answers. Among the passes, several answers mention "the context" or bare paragraph numbers, which is harmless but stylistically off.
 
 ## Fields
 
@@ -121,7 +129,10 @@ The main pattern is yes/no questions about rules that come with exceptions. Expe
 
 ## Limitations
 
-- **Synthetic.** Questions, answers and scores were produced by small open models (4B generator, 8B judge). See the spot-check: about 20% of reference answers may be wrong, especially on yes/no questions with exceptions. Verify answers before using them as hard ground truth. They work better for retrieval evaluation (via `chunk_id`) than for exact-answer grading.
+- **Reference answers are unreliable.** About 23% (8 of 35 spot-checked) are wrong or partly right, mostly yes/no questions about rules with exceptions. No critique checks answer correctness, so the filter does not remove them. Verify answers before using them as ground truth. The set works better for retrieval evaluation (via `chunk_id`) than for answer grading.
+- **Yes/no skew.** 95 of 133 questions (71%) are yes/no ("Can…", "Should…", "Does…"), and answers lean "Yes" (74) over "No" (11). A system that always answers "yes" will look better than it is on answer metrics.
+- **Synthetic, no human review.** Questions, answers and scores come from small open models (4B generator, 8B judge, same family). The spot-check was done by an LLM agent.
+- **Judge bias.** The 8B judge penalizes standard abbreviations (CE, PHI) on standalone, which removes valid Privacy Rule questions and skews the kept set toward FDA guidance.
 - **Single-hop.** One question per chunk, answerable from that chunk alone. No multi-hop or cross-section questions.
 - **Not legal advice.** Answers paraphrase regulatory text and may be incomplete. The CFR is a 2026-10-06 snapshot and the FDA guidance is the Feb 2026 version. Later amendments are not reflected.
 - **No PHI.** All inputs are public regulatory text. The dataset contains no real patient data or other personal information.

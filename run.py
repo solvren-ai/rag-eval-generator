@@ -243,8 +243,8 @@ SCORES = ("groundedness", "relevance", "standalone")
 WORK = OUT_DIR / "work"  # resumable per-stage outputs, one JSON line per chunk
 
 
-def read_jsonl(path):
-    return [json.loads(l) for l in open(path)] if path.exists() else []
+def read_jsonl(path):  # a last line without "\n" is a half-written row from a crash: skip it
+    return [json.loads(l) for l in open(path) if l.endswith("\n")] if path.exists() else []
 
 
 def critique_prompts(q, ctx):
@@ -300,11 +300,20 @@ def load_chunks(max_chunks=None):
 def run_stage(stage, args):
     """generate / judge: resumable, one chunk at a time, appends one JSON line per chunk."""
     model_id = args.model or MODELS[(stage, args.local)]
-    llm = make_llm(args.local, model_id, args.region, args.dry_run)
     gen_path, judge_path = WORK / "gen.jsonl", WORK / "judge.jsonl"
     out_path = gen_path if stage == "generate" else judge_path
     todo = load_chunks(args.max_chunks) if stage == "generate" else read_jsonl(gen_path)[: args.max_chunks]
-    done = {r["chunk_id"] for r in read_jsonl(out_path)}
+    b = out_path.read_bytes() if out_path.exists() else b""
+    if b and not b.endswith(b"\n") and not args.dry_run:  # drop a half-written last line so appends start on a fresh line
+        out_path.write_bytes(b[: b.rfind(b"\n") + 1])
+    # judge: a row with an unparsed (None) score is redone; filter keeps the latest row per chunk_id.
+    # generate is not retried: a new question would make the existing judge row stale.
+    prev = read_jsonl(out_path)
+    other = {r["generator_model" if stage == "generate" else "judge_model"] for r in prev} - {model_id}
+    if other and not args.dry_run:  # resuming with another model would silently mix models in one dataset
+        sys.exit(f"{out_path} already has rows from {', '.join(sorted(other))}; move data/work/ aside to switch models")
+    done = {r["chunk_id"] for r in prev if stage == "generate" or None not in (r[f"{k}_score"] for k in SCORES)}
+    llm = make_llm(args.local, model_id, args.region, args.dry_run)
     print(f"{stage} with {model_id}: {len(todo)} chunks, {len(done)} already done (resuming)")
     WORK.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -392,6 +401,9 @@ def selftest():
             pass
         filter_rows(4, force=True, work=d, out=d)
         assert len(read_jsonl(d / "test.jsonl")) == 1
+        with open(d / "judge.jsonl", "a") as f:  # crash mid-write: half a line, no newline
+            f.write('{"chunk_id": "c", "ground')
+        assert len(read_jsonl(d / "judge.jsonl")) == 1
     print("selftest ok")
 
 
