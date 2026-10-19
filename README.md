@@ -74,26 +74,38 @@ You're now ready to explore the lab notebook! You will be guided through connect
 
 `local/run_local.py` is a script port of the notebook that runs fully on Apple Silicon. It uses no AWS: a local [MLX](https://github.com/ml-explore/mlx-lm) model replaces Bedrock. It builds a RAG evaluation set over public US healthcare regulations instead of Amazon shareholder letters:
 
-- [45 CFR Part 164](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164) (HIPAA Security, Breach Notification and Privacy Rules), fetched from the eCFR API
+- [45 CFR Part 164](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164) (HIPAA Security, Breach Notification and Privacy Rules), eCFR snapshot of 2026-10-06
 - [FDA guidance: Cybersecurity in Medical Devices](https://www.fda.gov/media/119933/download) (Feb 2026)
 
-The pipeline is the same as the notebook's: chunk (1500/100) → question → compressed question → answer → supporting sentences → critique scores → filter. The relevance critique uses a compliance officer / healthcare privacy analyst persona. A third critique, standalone, was added. Rows are kept only when groundedness, relevance and standalone are all ≥ 4.
+The pipeline is the same as the notebook's: chunk (1500/100) → question → compressed question → answer → supporting sentences → critique scores → filter. The relevance critique uses a compliance officer / healthcare privacy analyst persona. A third critique, standalone, was added.
 
-Requirements: an Apple Silicon Mac, [uv](https://docs.astral.sh/uv/), about 3 GB of disk for the model and about 4 GB of free unified memory. If you hit a Metal out-of-memory error, close other GPU workloads and rerun.
+It runs in three stages, each in its own process so only one model is in memory at a time:
+
+1. `gen`: `mlx-community/Qwen3-4B-Instruct-2507-4bit` generates one row per chunk and scores it (self-scores).
+2. `judge`: `mlx-community/Qwen3-8B-4bit`, a different and larger model, re-scores every row.
+3. `finalize`: merges the outputs, keeps only rows where all three **judge** scores are ≥ 4, and exports the full chunk corpus.
+
+`gen` and `judge` append one line per chunk to `data/work/`. If a run dies (for example from a Metal out-of-memory error), rerun the same command and it continues from the last saved chunk.
+
+Requirements: an Apple Silicon Mac, [uv](https://docs.astral.sh/uv/), about 7 GB of disk for the two models and about 6 GB of free unified memory.
 
 ```sh
 git clone -b mac-local https://github.com/solvren-ai/generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems.git
 cd generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems
-uv run local/run_local.py --max-chunks 192  # what produced data/ (~38 min on an M5 16 GB, sharing the GPU)
-uv run local/run_local.py --max-chunks 5    # quick smoke test
+uv run local/run_local.py gen        # all chunks; rerun to resume
+uv run local/run_local.py judge      # rerun to resume
+uv run local/run_local.py finalize   # writes data/unfiltered.jsonl, data/test.jsonl, data/corpus.jsonl
+# smoke test: add --max-chunks 3 to gen and judge
 ```
 
-Options: `--model` (default `mlx-community/Qwen3-4B-Instruct-2507-4bit`), `--max-chunks`, `--min-score`, `--seed`.
+Options: `--model` (overrides the stage's default model), `--max-chunks`, `--min-score` (finalize, default 4).
 
 Outputs:
 - `source_docs/`: downloaded source files (untrusted data, gitignored)
-- `data/unfiltered.jsonl`: every generated row with all scores and reasoning
-- `data/test.jsonl`: filtered rows, Hugging Face-ready (see `DATASET_CARD.md`)
+- `data/work/`: resumable per-stage outputs (gitignored)
+- `data/unfiltered.jsonl`: every row with judge scores, reasoning and self-scores
+- `data/corpus.jsonl`: all chunks (retrieval corpus with distractors; joins on `chunk_id`)
+- `data/test.jsonl`: filtered rows, Hugging Face-ready (see `DATASET_CARD.md`). Published privately as `SolvrenAI/hipaa-fda-rag-eval`.
 
 ## Contributing
 

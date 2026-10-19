@@ -6,10 +6,15 @@
 
 Same pipeline: chunk -> question -> compressed question -> answer -> source sentences
 -> critique scores (groundedness, relevance, + standalone) -> filter.
+Stages (each resumable; rerun after an OOM and it continues from the last saved chunk):
+  gen      Qwen3-4B generates rows (+ self-critique scores)  -> data/work/gen.jsonl
+  judge    Qwen3-8B re-scores every row independently       -> data/work/judge.jsonl
+  finalize merge -> data/unfiltered.jsonl, filter on judge scores -> data/test.jsonl,
+           all chunks -> data/corpus.jsonl (retrieval corpus, joins on chunk_id)
 Bedrock Claude 3 Haiku is replaced by a local MLX model; Amazon shareholder letters
 are replaced by public US healthcare regulations. Chunks are processed one at a time.
 """
-import argparse, gzip, json, random, re, time, urllib.request
+import argparse, gzip, json, re, time, urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -19,8 +24,8 @@ OUT_DIR = ROOT / "data"
 
 SOURCES = {
     # HIPAA Privacy, Security and Breach Notification Rules (45 CFR Part 164), eCFR
-    "ecfr_45cfr164.xml": ("45 CFR Part 164 (HIPAA Privacy/Security/Breach Rules)",
-                          "https://www.ecfr.gov/api/versioner/v1/full/2025-10-01/title-45.xml?part=164"),
+    "ecfr_45cfr164_2026-10-06.xml": ("45 CFR Part 164 (HIPAA Privacy/Security/Breach Rules)",
+                                     "https://www.ecfr.gov/api/versioner/v1/full/2026-10-06/title-45.xml?part=164"),
     # FDA guidance: Cybersecurity in Medical Devices (Feb 2026)
     "fda_cybersecurity_medical_devices.pdf": ("FDA Guidance: Cybersecurity in Medical Devices",
                                               "https://www.fda.gov/media/119933/download"),
@@ -42,18 +47,19 @@ def download():
 
 
 def load_documents():
-    """Return [(text, source_label, url)] — one per CFR section / PDF page."""
+    """Return [(text, source_label, url, cfr_subpart)] — one per CFR section / PDF page."""
     docs = []
     for name, (label, url) in SOURCES.items():
         path = SRC_DIR / name
         if name.endswith(".xml"):
-            for sec in ET.parse(path).getroot().iter("DIV8"):
-                text = re.sub(r"[ \t]+", " ", "\n".join(" ".join(p.itertext()) for p in sec if p.tag in ("HEAD", "P", "FP")))
-                docs.append((text.strip(), f"45 CFR {sec.get('N')}", url))
+            for subpart in ET.parse(path).getroot().iter("DIV6"):
+                for sec in subpart.iter("DIV8"):
+                    text = re.sub(r"[ \t]+", " ", "\n".join(" ".join(p.itertext()) for p in sec if p.tag in ("HEAD", "P", "FP")))
+                    docs.append((text.strip(), f"45 CFR {sec.get('N')}", url, subpart.get("N")))
         else:
             from pypdf import PdfReader
             for i, page in enumerate(PdfReader(path).pages):
-                docs.append((page.extract_text() or "", f"{label}, p.{i + 1}", url))
+                docs.append((page.extract_text() or "", f"{label}, p.{i + 1}", url, None))
     return [d for d in docs if len(d[0]) > 200]
 
 
@@ -225,51 +231,82 @@ def reasoning(text):
     return m.group(1).strip() if m else None
 
 
+SCORES = ("groundedness", "relevance", "standalone")
+WORK = OUT_DIR / "work"  # resumable per-stage outputs, one JSON line per chunk
+
+
+def read_jsonl(path):
+    return [json.loads(l) for l in open(path)] if path.exists() else []
+
+
+def critique_prompts(q, ctx):
+    return [GROUNDEDNESS.format(question=q, context=ctx), RELEVANCE.format(question=q), STANDALONE.format(question=q)]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="mlx-community/Qwen3-4B-Instruct-2507-4bit")
-    ap.add_argument("--max-chunks", type=int, default=300)
-    ap.add_argument("--min-score", type=int, default=4, help="keep rows with all three scores >= this")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("stage", choices=["gen", "judge", "finalize"])
+    ap.add_argument("--model", help="default: Qwen3-4B-Instruct-2507 for gen, Qwen3-8B for judge")
+    ap.add_argument("--max-chunks", type=int, help="limit chunks (smoke tests); default all")
+    ap.add_argument("--min-score", type=int, default=4, help="keep rows with all three judge scores >= this")
     args = ap.parse_args()
+    WORK.mkdir(parents=True, exist_ok=True)
+    gen_path, judge_path = WORK / "gen.jsonl", WORK / "judge.jsonl"
 
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    if args.stage == "finalize":
+        judged = {r["chunk_id"]: r for r in read_jsonl(judge_path)}
+        rows = [{**r, **judged[r["chunk_id"]]} for r in read_jsonl(gen_path) if r["chunk_id"] in judged]
+        keep = [r for r in rows if all((r[f"{k}_score"] or 0) >= args.min_score for k in SCORES)]
+        corpus = [dict(chunk_id=r["chunk_id"], source=r["source"], source_url=r["source_url"], cfr_subpart=r["cfr_subpart"],
+                       in_embedding_train=r["in_embedding_train"], text=r["source_chunk"])
+                  for r in read_jsonl(gen_path)]  # every chunk = retrieval corpus incl. distractors
+        for name, rs in (("unfiltered.jsonl", rows), ("test.jsonl", keep), ("corpus.jsonl", corpus)):
+            with open(OUT_DIR / name, "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rs)
+        print(f"{len(rows)} generated+judged, {len(keep)} kept (all judge scores >= {args.min_score})")
+        return
+
     from mlx_lm import batch_generate, load
-
-    download()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100, separators=["\n\n", "\n", ".", " ", ""])
-    chunks = [(c, src, url) for text, src, url in load_documents() for c in splitter.split_text(text) if len(c) > 300]
-    random.Random(args.seed).shuffle(chunks)
-    chunks = chunks[: args.max_chunks]
-    print(f"{len(chunks)} chunks")
-
-    model, tok = load(args.model)
+    model_id = args.model or {"gen": "mlx-community/Qwen3-4B-Instruct-2507-4bit", "judge": "mlx-community/Qwen3-8B-4bit"}[args.stage]
+    model, tok = load(model_id)
 
     def llm(prompts, max_tokens):  # greedy decoding; prompts of ONE chunk batched together
         ids = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False) for p in prompts]
         return [t.strip() for t in batch_generate(model, tok, ids, max_tokens=max_tokens).texts]
 
-    OUT_DIR.mkdir(exist_ok=True)
-    rows, t0 = [], time.time()
-    with open(OUT_DIR / "unfiltered.jsonl", "w") as f:
-        for i, (ctx, src, url) in enumerate(chunks):
-            (q,) = llm([QUESTION.format(context=ctx)], 80)
-            comp, ans, sent, g, r, s = llm([
-                COMPRESS.format(question=q), ANSWER.format(question=q, context=ctx),
-                SOURCE.format(question=q, context=ctx), GROUNDEDNESS.format(question=q, context=ctx),
-                RELEVANCE.format(question=q), STANDALONE.format(question=q)], [64, 200, 400, 200, 200, 120])
-            row = dict(question=q, question_compressed=comp, answer=ans, context=sent, source_chunk=ctx,
-                       source=src, source_url=url,
-                       groundedness_score=rating(g), relevance_score=rating(r), standalone_score=rating(s),
-                       groundedness_reasoning=reasoning(g), relevance_reasoning=reasoning(r), standalone_reasoning=reasoning(s))
-            rows.append(row)
-            f.write(json.dumps(row) + "\n"); f.flush()
-            print(f"[{i + 1}/{len(chunks)}] {time.time() - t0:.0f}s G{row['groundedness_score']} R{row['relevance_score']} S{row['standalone_score']} {q[:80]}")
+    if args.stage == "gen":
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        download()
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100, separators=["\n\n", "\n", ".", " ", ""])
+        todo = [(f"{src}#{k}", c, src, url, sub) for text, src, url, sub in load_documents()
+                for k, c in enumerate(c for c in splitter.split_text(text) if len(c) > 300)][: args.max_chunks]
+    else:
+        todo = read_jsonl(gen_path)[: args.max_chunks]
+    done = {r["chunk_id"] for r in read_jsonl(gen_path if args.stage == "gen" else judge_path)}
+    print(f"{model_id}: {len(todo)} chunks, {len(done)} already done (resuming)")
 
-    keep = [r for r in rows if all((r[k] or 0) >= args.min_score for k in ("groundedness_score", "relevance_score", "standalone_score"))]
-    with open(OUT_DIR / "test.jsonl", "w") as f:
-        f.writelines(json.dumps(r) + "\n" for r in keep)
-    print(f"done in {time.time() - t0:.0f}s: {len(rows)} generated, {len(keep)} kept (all scores >= {args.min_score})")
+    t0 = time.time()
+    with open(gen_path if args.stage == "gen" else judge_path, "a") as f:
+        for i, item in enumerate(todo):
+            if (item[0] if args.stage == "gen" else item["chunk_id"]) in done:
+                continue
+            if args.stage == "gen":
+                cid, ctx, src, url, sub = item
+                (q,) = llm([QUESTION.format(context=ctx)], 80)
+                comp, ans, sent, *crit = llm([COMPRESS.format(question=q), ANSWER.format(question=q, context=ctx),
+                                              SOURCE.format(question=q, context=ctx), *critique_prompts(q, ctx)],
+                                             [64, 200, 400, 200, 200, 120])
+                row = dict(chunk_id=cid, question=q, question_compressed=comp, answer=ans, context=sent, source_chunk=ctx,
+                           source=src, source_url=url, cfr_subpart=sub, in_embedding_train=sub == "E",
+                           generator_model=model_id, **{f"self_{k}_score": rating(c) for k, c in zip(SCORES, crit)})
+            else:
+                crit = llm(critique_prompts(item["question"], item["source_chunk"]), [200, 200, 120])
+                row = dict(chunk_id=item["chunk_id"], judge_model=model_id,
+                           **{f"{k}_score": rating(c) for k, c in zip(SCORES, crit)},
+                           **{f"{k}_reasoning": reasoning(c) for k, c in zip(SCORES, crit)})
+            f.write(json.dumps(row) + "\n"); f.flush()
+            print(f"[{i + 1}/{len(todo)}] {time.time() - t0:.0f}s " + " ".join(f"{k.split('_')[-2][0].upper()}{v}" for k, v in row.items() if k.endswith("_score")))
+    print(f"{args.stage} done in {time.time() - t0:.0f}s")
 
 
 if __name__ == "__main__":
