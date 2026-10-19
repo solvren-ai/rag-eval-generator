@@ -62,13 +62,73 @@ For more information on the fine-grained action and resource permissions in Bedr
 Once your notebook environment is set up, clone this workshop repository into it.
 
 ```sh
-git clone https://github.com/aws-samples/generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems.git
-cd generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems/Notebook 
+git clone https://github.com/solvren-ai/rag-eval-generator.git
+cd rag-eval-generator/Notebook
 ```
 
 
 You're now ready to explore the lab notebook! You will be guided through connection the notebook to Amazon Bedrock for large language model access.
 
+
+## Run locally on Mac (or on Amazon Bedrock)
+
+`run.py` is a script port of the notebook with one CLI for both modes. It builds a RAG evaluation set over public US healthcare regulations instead of Amazon shareholder letters:
+
+- [45 CFR Part 164](https://www.ecfr.gov/current/title-45/subtitle-A/subchapter-C/part-164) (HIPAA Security, Breach Notification and Privacy Rules), eCFR snapshot of 2026-10-06
+- [FDA guidance: Cybersecurity in Medical Devices](https://www.fda.gov/media/119933/download) (Feb 2026)
+
+The pipeline is the same as the notebook's: chunk (1500/100) → question → compressed question → answer → supporting sentences → critique scores → filter. The relevance critique uses a compliance officer / healthcare privacy analyst persona. A third critique, standalone, was added. A **different** model from the generator judges every row, and rows are kept only when all three judge scores are ≥ 4.
+
+| Mode | Generator | Judge | Runs on |
+|---|---|---|---|
+| `--local` | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | `mlx-community/Qwen3-8B-4bit` | Apple Silicon via [MLX](https://github.com/ml-explore/mlx-lm) |
+| default (cloud) | `amazon.nova-lite-v1:0` | `us.anthropic.claude-sonnet-5-5` | Amazon Bedrock, boto3 Converse API |
+
+All model calls go through one function (`make_llm`), so both modes share the same pipeline. `generate` and `judge` append one line per chunk to `data/work/`. If a run dies (for example from a Metal out-of-memory error), rerun the same command and it continues from the last saved chunk. A half-written last line is dropped, and judge rows with an unparseable score are redone. Resuming with a different model than the one in `data/work/` is refused; move `data/work/` aside to switch models or modes. `all` runs each stage in its own process, so only one model is in memory at a time.
+
+### Commands
+
+```sh
+git clone https://github.com/solvren-ai/rag-eval-generator.git
+cd rag-eval-generator
+
+# local (Apple Silicon, no cloud)
+uv run run.py all --local                    # sources -> generate -> judge -> filter
+uv run run.py all --local --max-chunks 3     # smoke test (~30 s); filter refuses to shrink committed data/ (--force to overwrite)
+uv run run.py generate --local               # or stage by stage; rerun to resume
+uv run run.py judge --local
+uv run run.py filter                         # data/unfiltered.jsonl, data/test.jsonl, data/corpus.jsonl
+
+# cloud (Amazon Bedrock)
+uv run run.py all --dry-run --max-chunks 1   # print the Converse requests, send nothing to Bedrock
+uv run run.py all --region us-east-1
+uv run run.py generate --model us.amazon.nova-lite-v1:0   # override a stage's model (not allowed with all)
+
+# other
+uv run run.py sources                        # download + chunk only
+uv run run.py publish --dry-run              # show what would be pushed to HF
+uv run run.py publish                        # push card + data to SolvrenAI/hipaa-fda-rag-eval (never creates a public repo; updates the existing one, public or private)
+uv run run.py selftest                       # assert-based checks: model dispatch, filter guard, partial-line read
+```
+
+Shared flags: `--local`, `--dry-run` (cloud, `filter` and `publish`: print what would be sent or written, then send and write nothing; `sources` still downloads missing source files), `--model`, `--region` (default `us-east-1`), `--max-chunks`, `--min-score` (filter, default 4), `--force` (filter: allow replacing `data/*.jsonl` with fewer rows). On a fresh clone `data/work/` is empty, so a cloud dry-run of `judge` prints no requests until `generate` has run for real.
+
+All modes need network access to ecfr.gov and fda.gov the first time, to download the sources.
+
+**Local prerequisites:** an Apple Silicon Mac, [uv](https://docs.astral.sh/uv/), about 7 GB of disk for the two models and about 6 GB of free unified memory. `mlx-lm` installs only on macOS arm64.
+
+**Cloud prerequisites:** AWS credentials for an account with Amazon Bedrock model access to **Amazon Nova Lite** and **Anthropic Claude Sonnet 5.5** (for Anthropic models, the account's use-case form must be accepted), plus `bedrock:InvokeModel` on both. Because the judge goes through a cross-Region inference profile, the IAM policy must allow the inference profile (`arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-5-5`) and the foundation model in every destination Region (`arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-5`); the example policy above covers only foundation models. Sonnet 5.5 has no in-Region endpoint in us-east-1, so the judge uses the `us.` cross-Region inference profile. Use `--model` to point at a `global.` profile or another Region's profile.
+
+**Publish prerequisites:** `HF_TOKEN` with write access to the `SolvrenAI` org, either in the environment or in `../.env` (`--env-file` to change). It is read into the process environment only and never printed.
+
+Outputs:
+- `source_docs/`: downloaded source files (untrusted data, gitignored)
+- `data/work/`: resumable per-stage outputs (gitignored)
+- `data/unfiltered.jsonl`: every row with judge scores, reasoning and self-scores
+- `data/corpus.jsonl`: all chunks (retrieval corpus with distractors; joins on `chunk_id`)
+- `data/test.jsonl`: filtered rows, Hugging Face-ready (see `DATASET_CARD.md`). Published as [`SolvrenAI/hipaa-fda-rag-eval`](https://huggingface.co/datasets/SolvrenAI/hipaa-fda-rag-eval).
+
+The published dataset was generated in `--local` mode.
 
 ## Contributing
 
