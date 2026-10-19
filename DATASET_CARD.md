@@ -58,7 +58,7 @@ qa_heldout = qa.filter(lambda r: not r["in_embedding_train"])   # 87 rows
 
 ## Generation method
 
-This is a local port of the AWS sample [generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems](https://github.com/aws-samples/generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems) (MIT-0). The code is at [solvren-ai/rag-eval-generator](https://github.com/solvren-ai/rag-eval-generator) (`run.py`, `--local` mode). Everything ran locally on an Apple M5 (16 GB) with `mlx-lm` 0.32.2 and greedy decoding. No cloud APIs were used.
+This is a local port of the AWS sample [generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems](https://github.com/aws-samples/generating-synthetic-datasets-for-evaluating-retrieval-augmented-generation-systems) (MIT-0). The code is at [solvren-ai/rag-eval-generator@47262fb](https://github.com/solvren-ai/rag-eval-generator/tree/47262fbc87aeb507f42c066ee8744944edb9e01b) (`run.py`, `--local` mode; it reproduces the committed chunks and filter output exactly). Everything ran locally on an Apple M5 (16 GB) with `mlx-lm` 0.32.2 and greedy decoding. No cloud APIs were used.
 
 1. **Chunking.** The CFR is split one document per section, the FDA PDF one document per page. Each document is chunked with `RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=100)`, dropping chunks under 300 characters, giving 345 chunks. Every chunk is used.
 2. **Generation.** [`mlx-community/Qwen3-4B-Instruct-2507-4bit`](https://huggingface.co/mlx-community/Qwen3-4B-Instruct-2507-4bit) (Apache-2.0) produces, for each chunk: a question, a compressed rewrite, a reference answer grounded only in the chunk, and the supporting sentences (`context`). It also self-scores the question (`self_*_score`).
@@ -85,7 +85,7 @@ Self-scores (Qwen3-4B, all 345): groundedness 5:113 / 4:185 / 3:20 / 2:25 / 1:2;
 
 ### Spot-check
 
-This was a manual spot-check of 20 random kept rows (`random.Random(42).sample` over `data/test.jsonl`) by an automated reviewer (LLM agent), not a human. Each answer was checked against its `source_chunk`. **16 of 20 passed (80%).** The failures:
+An LLM agent, not a human, spot-checked 20 random kept rows (`random.Random(42).sample` over `data/test.jsonl`). Each answer was checked against its `source_chunk`. **16 of 20 passed (80%).** The failures:
 
 | chunk_id | Failure type |
 |---|---|
@@ -132,6 +132,7 @@ The main pattern is yes/no questions about rules that come with exceptions. Expe
 ```sh
 git clone https://github.com/solvren-ai/rag-eval-generator.git
 cd rag-eval-generator
+git checkout 47262fbc87aeb507f42c066ee8744944edb9e01b
 uv run run.py generate --local   # Qwen3-4B; resumable
 uv run run.py judge --local      # Qwen3-8B; resumable
 uv run run.py filter             # data/unfiltered.jsonl, data/test.jsonl, data/corpus.jsonl
@@ -148,7 +149,7 @@ If you use this dataset in your work, please cite:
   year         = {2026},
   publisher    = {Hugging Face},
   howpublished = {\url{https://huggingface.co/datasets/SolvrenAI/hipaa-fda-rag-eval}},
-  note         = {Code: https://github.com/solvren-ai/rag-eval-generator}
+  note         = {Code: https://github.com/solvren-ai/rag-eval-generator/tree/47262fbc87aeb507f42c066ee8744944edb9e01b}
 }
 ```
 
