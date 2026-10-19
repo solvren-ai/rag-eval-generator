@@ -72,7 +72,7 @@ def load_documents():
 
 
 # ---------------------------------------------------------------- prompts
-# Generation prompts are the notebook's, unchanged except for the domain wording.
+# Generation prompts are the notebook's, unchanged except for the domain wording and QUESTION rule 10 (against yes/no bias).
 QUESTION = """<Instructions>
 Here is some context from a US healthcare regulation or regulatory guidance document:
 <context>
@@ -91,6 +91,7 @@ Your task is to generate 1 question that a compliance officer or healthcare priv
 7. Do not use phrases like 'provided context', 'this section', 'this document', etc. in the question.
 8. Avoid framing questions using the word "and" that can be decomposed into more than one question.
 9. The question should not contain more than 20 words, make use of abbreviations (e.g. HIPAA, PHI, CE, BA) wherever possible.
+10. Prefer an open question (what, when, who, how long, under what conditions). Ask a yes/no question only if the context states a clear prohibition or exception, and then frame it so the correct answer is often "No".
 </rules>
 
 To generate the question, first identify the most important or relevant part of the context. Then frame a question around that part that satisfies all the rules above.
@@ -433,6 +434,7 @@ def selftest():
     out = make_llm(False, MODELS[("judge", False)], dry_run=True)(["p1", "p2"], [10, 20])  # cloud dry-run: no AWS client, no call
     assert out == ["[dry-run]", "[dry-run]"]
     assert len(critique_prompts("q", "c")) == 3 and "<answer>\na\n</answer>" in critique_prompts("q", "c", "a")[3]
+    assert "Prefer an open question" in QUESTION and '"No"' in QUESTION
     assert may_publish(True, False) and may_publish(True, True) and may_publish(False, True) and not may_publish(False, False)
     import tempfile
     with tempfile.TemporaryDirectory() as d:  # filter must not shrink existing data (fresh clone / smoke run)
